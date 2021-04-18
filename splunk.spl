@@ -1,0 +1,62 @@
+Geographically Improbable Travel: Calculates previous login attempts versus recent login attempts; compares their locations and how fast the user would have had to be going to sign in from both places. If it's improbable/impossible for the user to have signed in from both locations in a short time frame, an alert is created.
+index=<AZURE_AD_INDEX> sourcetype="aad:enterprise:signin" status.errorCode!=50126 status.additionalDetails!="MFA requirement satisfied by claim in the token" (status.errorCode=500121 OR status.errorCode=50053 OR status.errorCode=50072 OR status.errorCode=50074 OR status.errorCode=50076 OR status.errorCode=50097 OR status.errorCode=50155 OR status.errorCode=530003 OR status.errorCode=53001 OR status.errorCode=53003) 
+| sort 0 userPrincipalName, _time 
+| streamstats window=1 current=f values(_time) as last_time values(ipAddress) as last_src by userPrincipalName 
+| where last_src != ipAddress AND _time - last_time < 8*60*60 
+| iplocation last_src 
+| rename lat as last_lat lon as last_lon 
+| eval location = City . "|" . Country . "|" . Region 
+| eval locJoin = mvjoin(location,"|") 
+| iplocation ipAddress 
+| eval rlat1 = pi()*last_lat/180, rlat2=pi()*lat/180, rlat = pi()*(lat-last_lat)/180, rlon= pi()*(lon-last_lon)/180 
+| eval a = sin(rlat/2) * sin(rlat/2) + cos(rlat1) * cos(rlat2) * sin(rlon/2) * sin(rlon/2) 
+| eval c = 2 * atan2(sqrt(a), sqrt(1-a)) 
+| eval distance = 6371 * c, time_difference_hours = round((_time - last_time) / 3600,2), speed=round(distance/ ( time_difference_hours),2) 
+| fields - rlat* a c 
+| eval day=strftime(_time, "%m/%d/%Y %H:%M:%S") 
+| stats values(status.errorCode) as Error_Code values(status.failureReason) values(distance) values(ipAddress) values(eval(mvappend(last_Country, Country))) as Country values(eval(mvappend(last_City, City))) as City values(eval(mvappend(last_Region, Region))) as Region values(lat) values(lon) values(deviceDetail.operatingSystem) max(speed) as max_speed_kph min(time_difference_hours) as min_time_difference_hours by userPrincipalName 
+| where max_speed_kph>900
+
+
+Geographically Improbable Travel (V2): Similar to the query above, but the results are no longer grouped and are displayed in a table. This alert works better when looking at one particular user's sign in activity. It shows current/recent login versus previous login within the same row.
+index=<AZURE_AD_INDEX> sourcetype="aad:enterprise:signin" 
+| eventstats dc(ipAddress) as src_count by userPrincipalName 
+| search src_count>1 
+| sort 0 + _time 
+| iplocation ipAddress 
+| where isnotnull(lat) AND isnotnull(lon) 
+| streamstats window=2 earliest(lat) as prev_lat, earliest(lon) as prev_lon, earliest(_time) as prev_time, earliest(ipAddress) as prev_src, earliest(City) as prev_city, earliest(Country) as prev_country, earliest(clientAppUsed) as prev_app, earliest(status.errorCode) as prev_error by userPrincipalName 
+| where (ipAddress != prev_src) 
+| eval lat1_r=((lat * 3.14159265358) / 180), lat2_r=((prev_lat * 3.14159265358) / 180), delta=(((prev_lon - lon) * 3.14159265358) / 180), distance=(3959 * acos(((sin(lat1_r) * sin(lat2_r)) + ((cos(lat1_r) * cos(lat2_r)) * cos(delta))))), distance=round(distance,2) 
+| fields - lat1_r, lat2_r, long1_r, long2_r, delta 
+| eval time_diff=if((('_time' - prev_time) == 0),1,('_time' - prev_time)), speed=round(((distance * 3600) / time_diff),2) 
+| where (speed > 500) 
+| eval prev_time=strftime(prev_time,"%Y-%m-%d %H:%M:%S") 
+| rename ipAddress as src userPrincipalName as user City as city Country as country clientAppUsed as app status.errorCode as error 
+| table user, src, _time, city, country, app, error, prev_src, prev_time, prev_city, prev_country, prev_app, prev_error, distance, speed
+
+
+Failed Logins: # Evaluates certain error codes as Successful_Logins, Failed_Login_Attempts_Using_Password, Attempts_Against_Locked, and MFA_Satisfied login attempts for a particular user over a 1hr time frame. If there is a certain number of Failed login attempts using their password (i.e. MFA wasn't satisfied), an event will be created.
+index=<AZURE_AD_INDEX> sourcetype="aad:enterprise:signin" status.errorCode=* 
+| rename deviceDetail.displayName as deviceName deviceDetail.browser as deviceBrowser status.errorCode as errorCode deviceDetail.operatingSystem as deviceOS status.additionalDetails as statusDetails status.failureReason as failureReason 
+| bin _time span=1hr 
+| stats count(eval(errorCode=0)) as Successful_Logins, count(eval(errorCode=50097)) as Failed_Login_Attempts_Using_Password, count(eval(errorCode=50053)) as Attempts_Against_Locked, count(eval(statusDetails="MFA requirement satisfied by claim in the token")) as MFA_Satisfied count as Total_Attempts, by _time, userPrincipalName 
+| streamstats time_window=1hr sum(Total_Attempts) as Total_Attempts by userPrincipalName 
+| where Failed_Login_Attempts_Using_Password>10
+
+
+RAW Content Query: Looks at proxy traffic where the user visits "raw.*" websites such as "raw.githubusercontent.com" using strange user agents. This may help identify malicious software trying to download and execute additional code stored on a github repository.
+index=<PROXY_INDEX>
+    url="raw.*"
+    url!="*/ublockorigin/*"
+    url!="*.gif"
+    url!="*.jpg"
+    url!="*.png"
+    url!="*.ico"
+    useragent!="*Mozilla/*"
+    useragent!="*ZTunnel/1.0"
+    useragent!="Unknown"
+| dedup url 
+| table _time user url useragent
+| stats dc(useragent) as user_agent_count, values(useragent) as user_agents, list(url) as urls by user
+| sort -user_agent_count
